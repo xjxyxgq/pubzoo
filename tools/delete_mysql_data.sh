@@ -29,15 +29,15 @@ NC='\033[0m' # No Color
 
 # 日志函数
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1" >&2
 }
 
 # 检查MySQL连接
@@ -76,7 +76,7 @@ validate_sql() {
     
     # 检查LIMIT值是否合理（不超过10000）
     local limit_value=$(echo "$sql_upper" | sed -n 's/.*LIMIT[[:space:]]\+\([0-9]\+\).*/\1/p')
-    if [ "$limit_value" -gt 10000 ]; then
+    if [ -n "$limit_value" ] && [ "$limit_value" -gt 10000 ]; then
         log_warn "LIMIT值较大($limit_value)，建议设置为较小的值以避免长时间锁表"
         echo -n "是否继续执行此SQL？(y/N): "
         read -r confirm
@@ -126,23 +126,29 @@ get_total_count() {
     # 检查count_sql是否生成成功
     if [ -z "$count_sql" ]; then
         log_error "无法生成COUNT查询语句"
-        echo "0"
+        echo "ERROR"
         return 1
     fi
     
-    local count=$(mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -s -N -e "$count_sql" "$MYSQL_DATABASE" 2>/dev/null)
+    # 执行COUNT查询，同时捕获stdout和stderr
+    local mysql_output=$(mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -s -N -e "$count_sql" "$MYSQL_DATABASE" 2>&1)
     local exit_code=$?
     
     if [ $exit_code -ne 0 ]; then
         log_error "执行COUNT查询失败: $count_sql"
-        echo "0"
+        log_error "MySQL错误信息: $mysql_output"
+        echo "ERROR"
         return 1
     fi
     
+    # 清理输出，去除可能的空白字符
+    local count=$(echo "$mysql_output" | tr -d '\r\n\t ' | head -n 1)
+    
     # 验证结果是否为数字
     if ! [[ "$count" =~ ^[0-9]+$ ]]; then
-        log_warn "COUNT查询返回非数字结果: $count，使用默认值0"
-        count=0
+        log_error "COUNT查询返回非数字结果: '$mysql_output'，可能表不存在或查询语法错误"
+        echo "ERROR"
+        return 1
     fi
     
     echo "$count"
@@ -184,7 +190,14 @@ execute_sql_loop() {
     
     # 获取初始记录数
     local total_count=$(get_total_count "$delete_sql")
-    if [ -z "$total_count" ] || [ "$total_count" -eq 0 ]; then
+    
+    # 检查total_count是否为有效数字
+    if [ -z "$total_count" ] || [ "x$total_count" = "xERROR" ] || ! [[ "$total_count" =~ ^[0-9]+$ ]]; then
+        log_error "第 $sql_index 条SQL: 无法获取有效的记录数量，可能表不存在或查询失败。返回值: $total_count"
+        return 1
+    fi
+    
+    if [ "x$total_count" = "x0" ]; then
         log_info "第 $sql_index 条SQL: 没有符合条件的记录需要删除"
         return 0
     fi
@@ -205,18 +218,27 @@ execute_sql_loop() {
         fi
         
         # 如果没有删除任何记录，说明已经删除完毕
-        if [ "$affected_rows" -eq 0 ]; then
+        if [ "x$affected_rows" = "x0" ]; then
             log_info "第 $sql_index 条SQL: 所有符合条件的记录已删除完毕"
             break
         fi
         
-        deleted_count=$((deleted_count + affected_rows))
+        # 确保affected_rows是数字，防止算术错误
+        if [[ "$affected_rows" =~ ^[0-9]+$ ]]; then
+            deleted_count=$((deleted_count + affected_rows))
+        else
+            log_warn "affected_rows不是有效数字: $affected_rows，跳过累加"
+        fi
         loop_count=$((loop_count + 1))
         
         # 定期输出进度
         if [ $((loop_count % LOG_INTERVAL)) -eq 0 ]; then
             local remaining_count=$(get_total_count "$delete_sql")
-            log_info "第 $sql_index 条SQL: 已删除 $deleted_count 条记录，剩余 $remaining_count 条记录"
+            if [ "x$remaining_count" = "xERROR" ] || ! [[ "$remaining_count" =~ ^[0-9]+$ ]]; then
+                log_info "第 $sql_index 条SQL: 已删除 $deleted_count 条记录，剩余记录数查询失败"
+            else
+                log_info "第 $sql_index 条SQL: 已删除 $deleted_count 条记录，剩余 $remaining_count 条记录"
+            fi
         fi
         
         # 休眠一段时间，避免对数据库造成过大压力
