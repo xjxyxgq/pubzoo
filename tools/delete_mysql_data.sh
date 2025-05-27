@@ -100,8 +100,21 @@ validate_sql() {
 # 从DELETE语句中提取表名和WHERE条件，用于统计记录数
 extract_count_sql() {
     local delete_sql="$1"
-    # 提取表名和WHERE条件
-    local count_sql=$(echo "$delete_sql" | sed -E 's/DELETE FROM ([^ ]+)(.*) LIMIT [0-9]+/SELECT COUNT(*) FROM \1\2/')
+    
+    # 转换为大写进行处理，确保大小写不敏感
+    local sql_upper=$(echo "$delete_sql" | tr '[:lower:]' '[:upper:]')
+    
+    # 修复正则表达式：匹配 DELETE FROM table_name WHERE ... LIMIT n
+    # 使用非贪婪匹配来正确捕获WHERE子句
+    local count_sql=$(echo "$sql_upper" | sed -E 's/^[[:space:]]*DELETE[[:space:]]+FROM[[:space:]]+([^[:space:]]+)[[:space:]]+(WHERE.*)[[:space:]]+LIMIT[[:space:]]+[0-9]+[[:space:]]*$/SELECT COUNT(*) FROM \1 \2/')
+    
+    # 验证生成的SQL是否为有效的SELECT语句
+    if [[ ! "$count_sql" =~ ^SELECT[[:space:]]+COUNT\(\*\)[[:space:]]+FROM[[:space:]]+ ]]; then
+        log_error "无法从DELETE语句生成有效的COUNT查询: $delete_sql"
+        echo ""
+        return 1
+    fi
+    
     echo "$count_sql"
 }
 
@@ -109,14 +122,40 @@ extract_count_sql() {
 get_total_count() {
     local delete_sql="$1"
     local count_sql=$(extract_count_sql "$delete_sql")
+    
+    # 检查count_sql是否生成成功
+    if [ -z "$count_sql" ]; then
+        log_error "无法生成COUNT查询语句"
+        echo "0"
+        return 1
+    fi
+    
     local count=$(mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -s -N -e "$count_sql" "$MYSQL_DATABASE" 2>/dev/null)
+    local exit_code=$?
+    
+    if [ $exit_code -ne 0 ]; then
+        log_error "执行COUNT查询失败: $count_sql"
+        echo "0"
+        return 1
+    fi
+    
+    # 验证结果是否为数字
+    if ! [[ "$count" =~ ^[0-9]+$ ]]; then
+        log_warn "COUNT查询返回非数字结果: $count，使用默认值0"
+        count=0
+    fi
+    
     echo "$count"
 }
 
 # 执行删除操作
 execute_delete() {
     local delete_sql="$1"
-    local result=$(mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -e "$delete_sql" "$MYSQL_DATABASE" 2>&1)
+    
+    # 使用事务和ROW_COUNT()函数来准确获取影响行数
+    local sql_with_count="$delete_sql; SELECT ROW_COUNT() AS affected_rows;"
+    
+    local result=$(mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -s -N -e "$sql_with_count" "$MYSQL_DATABASE" 2>&1)
     local exit_code=$?
     
     if [ $exit_code -ne 0 ]; then
@@ -124,9 +163,12 @@ execute_delete() {
         return 1
     fi
     
-    # 获取受影响的行数
-    local affected_rows=$(echo "$result" | grep "Query OK" | sed 's/.*Query OK, \([0-9]*\) row.*/\1/')
-    if [ -z "$affected_rows" ]; then
+    # 获取受影响的行数（ROW_COUNT()的结果在最后一行）
+    local affected_rows=$(echo "$result" | tail -n 1 | tr -d '\r\n')
+    
+    # 验证结果是否为数字
+    if ! [[ "$affected_rows" =~ ^[0-9]+$ ]]; then
+        log_warn "无法获取准确的影响行数，使用默认值0。原始结果: $result"
         affected_rows=0
     fi
     
