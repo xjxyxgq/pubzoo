@@ -131,7 +131,7 @@ get_total_count() {
     fi
     
     # 执行COUNT查询，同时捕获stdout和stderr
-    local mysql_output=$(mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -s -N -e "$count_sql" "$MYSQL_DATABASE" 2>&1)
+    local mysql_output=$(mysql -h"$MYSQL_HOST" -P"$MYSQL_PORT" -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" -s -N -e "$count_sql" "$MYSQL_DATABASE" 2>/dev/null)
     local exit_code=$?
     
     if [ $exit_code -ne 0 ]; then
@@ -341,3 +341,4 @@ trap cleanup SIGINT SIGTERM
 
 # 执行主函数
 main "$@" 
+
