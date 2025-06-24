@@ -140,19 +140,27 @@ echo "[*] 开始压测..."
 echo "=========================================="
 
 # ======== 启动 stress-ng ========
+# 使用 SIGSTOP 机制避免启动初期资源失控
+echo "[*] 启动 stress-ng 进程（暂停状态）..."
 eval "$FINAL_CMD" &
 STRESS_PID=$!
 
-# ======== 将进程加入 cgroup ========
-sleep 0.5  # 等待进程完全启动
+# 立即暂停进程，防止资源使用失控
+kill -STOP $STRESS_PID
+echo "[*] stress-ng 进程 ($STRESS_PID) 已暂停，准备加入 cgroup..."
 
+# ======== 将进程加入 cgroup ========
 if [[ "$CGROUP_TYPE" == "v2" ]]; then
     echo "$STRESS_PID" | sudo tee "$CGROUP_PATH/cgroup.procs" > /dev/null
 elif [[ "$CGROUP_TYPE" == "v1" ]]; then
     echo "$STRESS_PID" | sudo tee "$CGROUP_PATH/tasks" > /dev/null
 fi
 
-echo "[✓] stress-ng 进程 ($STRESS_PID) 已加入 cgroup"
+echo "[✓] stress-ng 进程已加入 cgroup，正在恢复执行..."
+
+# 恢复进程执行，现在已受 cgroup 限制
+kill -CONT $STRESS_PID
+echo "[✓] stress-ng 开始受限执行 (cgroup + nice/ionice)"
 
 # ======== 实时监控函数 ========
 monitor_cpu() {
