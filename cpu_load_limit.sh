@@ -6,9 +6,25 @@ DURATION=${2:-300}               # 压测持续时间（秒），默认 300 秒
 THREADS=${3:-auto}              # 压力线程数（默认自动推荐）
 NICE_LEVEL=${4:-19}             # nice 优先级（-20 到 19，数值越高优先级越低），默认 19
 DISABLE_CGROUP=${5:-false}      # 是否禁用 cgroup（调试用），默认 false
+CUSTOM_PERIOD_MS=${6:-auto}     # 自定义调度周期（毫秒），auto=架构自适应
 
 GROUP_NAME="cpu_limit_smart"
-PERIOD_US=100000                # 默认调度周期（100ms）
+
+# 调度周期配置
+if [[ "$CUSTOM_PERIOD_MS" != "auto" ]]; then
+    # 用户自定义周期
+    PERIOD_US=$(( CUSTOM_PERIOD_MS * 1000 ))
+    echo "[*] 使用自定义调度周期: ${CUSTOM_PERIOD_MS}ms (${PERIOD_US}μs)"
+elif [[ "$ARCH" =~ ^(aarch64|arm64|armv7l|armv8)$ ]]; then
+    # ARM 架构调度周期优化
+    PERIOD_US=1000000           # ARM使用1000ms周期，避免调度粒度问题
+    echo "[*] ARM 架构检测：使用扩大的调度周期 (1000ms) 以适应低功耗调度器"
+    echo "    └─ 这解决了ARM系统调度粒度过大导致的quota无法分配问题"
+else
+    # x86使用标准100ms周期
+    PERIOD_US=100000
+    echo "[*] x86 架构：使用标准调度周期 (100ms)"
+fi
 
 # ======== 环境检查 ========
 echo "=========================================="
@@ -18,6 +34,13 @@ echo "=========================================="
 # 检测系统架构
 ARCH=$(uname -m)
 echo "[*] 系统架构: $ARCH"
+
+# 详细系统信息诊断
+echo "[*] 系统详情诊断:"
+echo "    ├─ 内核版本: $(uname -r)"
+echo "    ├─ 发行版: $(cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d'"' -f2 || echo "Unknown")"
+echo "    ├─ CPU 型号: $(cat /proc/cpuinfo 2>/dev/null | grep 'model name' | head -1 | cut -d':' -f2 | xargs || echo "Unknown")"
+echo "    └─ CPU 拓扑: $(lscpu 2>/dev/null | grep 'Thread(s) per core' | cut -d':' -f2 | xargs || echo "Unknown")"
 
 # 检查 stress-ng
 if ! command -v stress-ng &> /dev/null; then
@@ -31,6 +54,17 @@ fi
 # 显示 stress-ng 版本信息
 STRESS_VERSION=$(stress-ng --version 2>/dev/null | head -1 || echo "Unknown")
 echo "[*] stress-ng 版本: $STRESS_VERSION"
+
+# cgroup 功能检查
+echo "[*] cgroup 功能诊断:"
+if [[ -f /proc/cgroups ]]; then
+    echo "    ├─ 可用控制器:"
+    cat /proc/cgroups | grep -E "(cpu|cpuset|memory)" | while read line; do
+        echo "        └─ $line"
+    done
+else
+    echo "    ├─ /proc/cgroups 不存在"
+fi
 
 # 检查 sudo 权限
 if ! sudo -n true 2>/dev/null; then
@@ -67,22 +101,17 @@ fi
 CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "1")
 
 if [[ "$THREADS" == "auto" ]]; then
-    # ARM 架构使用不同的线程策略
-    if [[ "$ARCH" =~ ^(aarch64|arm64|armv7l|armv8)$ ]]; then
-        # ARM 架构：使用核心数作为线程数，效果更好
-        THREADS=$CPU_CORES
-        echo "[*] ARM 架构检测：使用核心数作为线程数"
-    else
-        # x86 架构：根据目标 CPU 使用率计算
-        RECOMMENDED_THREADS=$(( CPU_CORES * TARGET_CPU_PERCENT / 100 ))
-        THREADS=$(( RECOMMENDED_THREADS > 0 ? RECOMMENDED_THREADS : 1 ))
-        
-        # 确保线程数不超过核心数的 1.5 倍
-        MAX_THREADS=$(( CPU_CORES * 3 / 2 ))
-        if [[ $THREADS -gt $MAX_THREADS ]]; then
-            THREADS=$MAX_THREADS
-        fi
+    # 通用线程数计算策略
+    RECOMMENDED_THREADS=$(( CPU_CORES * TARGET_CPU_PERCENT / 100 ))
+    THREADS=$(( RECOMMENDED_THREADS > 0 ? RECOMMENDED_THREADS : 1 ))
+    
+    # 确保线程数不超过核心数的 1.5 倍（避免过度竞争）
+    MAX_THREADS=$(( CPU_CORES * 3 / 2 ))
+    if [[ $THREADS -gt $MAX_THREADS ]]; then
+        THREADS=$MAX_THREADS
     fi
+    
+    echo "[*] 自动计算线程数：${THREADS}个 (基于${CPU_CORES}核心，目标${TARGET_CPU_PERCENT}%)"
 fi
 
 echo "[*] 系统逻辑核心数: $CPU_CORES"
@@ -155,7 +184,7 @@ if [[ "$CGROUP_ENABLED" == "true" ]]; then
         fi
         
     elif [[ "$CGROUP_TYPE" == "v1" ]]; then
-        # cgroup v1 配置 - 修复计算错误
+                # cgroup v1 配置
         QUOTA_US=$(( TARGET_CPU_PERCENT * PERIOD_US / 100 ))
         echo "[*] 配置 cgroup v1 CPU 限制: ${QUOTA_US}μs / ${PERIOD_US}μs (${TARGET_CPU_PERCENT}%)"
         echo "$PERIOD_US" | sudo tee "$CGROUP_PATH/cpu.cfs_period_us" > /dev/null
@@ -280,12 +309,47 @@ sleep 2
 # 验证子进程也被加入cgroup（stress-ng可能会创建子进程）
 if [[ "$CGROUP_ENABLED" == "true" ]]; then
     echo "[*] 检查所有相关进程是否在 cgroup 中..."
+    
+    # 获取所有 stress-ng 相关进程
+    ALL_STRESS_PIDS=$(pgrep -f "stress-ng" | tr '\n' ' ')
+    echo "[*] 系统中所有 stress-ng 进程: $ALL_STRESS_PIDS"
+    
     if [[ "$CGROUP_TYPE" == "v2" ]]; then
-        PROCS_IN_CGROUP=$(cat "$CGROUP_PATH/cgroup.procs" 2>/dev/null | wc -l)
+        PROCS_IN_CGROUP=$(cat "$CGROUP_PATH/cgroup.procs" 2>/dev/null)
+        PROC_COUNT=$(echo "$PROCS_IN_CGROUP" | wc -l)
+        echo "[*] cgroup 中的进程数: $PROC_COUNT"
+        echo "[*] cgroup 中的进程列表: $PROCS_IN_CGROUP"
+        
+        # 将所有 stress-ng 进程加入 cgroup
+        for pid in $ALL_STRESS_PIDS; do
+            if [[ -n "$pid" ]]; then
+                echo "$pid" | sudo tee "$CGROUP_PATH/cgroup.procs" > /dev/null 2>&1
+                echo "    └─ 添加进程 $pid 到 cgroup"
+            fi
+        done
+        
     elif [[ "$CGROUP_TYPE" == "v1" ]]; then
-        PROCS_IN_CGROUP=$(cat "$CGROUP_PATH/tasks" 2>/dev/null | wc -l)
+        PROCS_IN_CGROUP=$(cat "$CGROUP_PATH/tasks" 2>/dev/null)
+        PROC_COUNT=$(echo "$PROCS_IN_CGROUP" | wc -l)
+        echo "[*] cgroup 中的进程数: $PROC_COUNT"
+        echo "[*] cgroup 中的进程列表: $PROCS_IN_CGROUP"
+        
+        # 将所有 stress-ng 进程加入 cgroup
+        for pid in $ALL_STRESS_PIDS; do
+            if [[ -n "$pid" ]]; then
+                echo "$pid" | sudo tee "$CGROUP_PATH/tasks" > /dev/null 2>&1
+                echo "    └─ 添加进程 $pid 到 cgroup"
+            fi
+        done
     fi
-    echo "[*] cgroup 中的进程数: $PROCS_IN_CGROUP"
+    
+    echo "[*] 重新检查 cgroup 进程数..."
+    if [[ "$CGROUP_TYPE" == "v2" ]]; then
+        FINAL_COUNT=$(cat "$CGROUP_PATH/cgroup.procs" 2>/dev/null | wc -l)
+    elif [[ "$CGROUP_TYPE" == "v1" ]]; then
+        FINAL_COUNT=$(cat "$CGROUP_PATH/tasks" 2>/dev/null | wc -l)
+    fi
+    echo "[*] 最终 cgroup 中的进程数: $FINAL_COUNT"
 fi
 
 # ======== 改进的实时监控函数 ========
@@ -413,7 +477,7 @@ ARM 架构优化：
 └── 兼容性测试确保稳定运行
 
 使用方法：
-  sudo ./cpu_load_limit.sh [CPU%] [时长s] [线程数] [nice值] [禁用cgroup]
+  sudo ./cpu_load_limit.sh [CPU%] [时长s] [线程数] [nice值] [禁用cgroup] [调度周期ms]
   
 参数说明：
   - CPU%: 1-100，cgroup 硬限制上限
@@ -421,10 +485,12 @@ ARM 架构优化：
   - 线程数: 'auto' 或具体数字
   - nice值: -20到19，19为最低优先级
   - 禁用cgroup: true/false，默认false（调试用）
+  - 调度周期ms: auto/数字，auto=架构自适应（ARM=1000ms, x86=100ms）
   
 示例：
-  sudo ./cpu_load_limit.sh 30 120 auto 19        # 30%限制，120秒，最低优先级
-  sudo ./cpu_load_limit.sh 50 60 4 15            # 50%限制，60秒，4线程
-  sudo ./cpu_load_limit.sh 50 60 auto 19 true    # 禁用cgroup，仅使用nice/ionice
+  sudo ./cpu_load_limit.sh 30 120 auto 19              # 30%限制，120秒，最低优先级
+  sudo ./cpu_load_limit.sh 50 60 4 15                  # 50%限制，60秒，4线程  
+  sudo ./cpu_load_limit.sh 50 60 auto 19 true          # 禁用cgroup，仅使用nice/ionice
+  sudo ./cpu_load_limit.sh 30 300 auto 19 false 2000  # 使用2000ms调度周期（适合低功耗ARM）
 
 EOF
