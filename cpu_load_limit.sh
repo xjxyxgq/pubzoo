@@ -14,6 +14,10 @@ echo "=========================================="
 echo "[*] CPU 负载压测工具 - 双重隔离策略"
 echo "=========================================="
 
+# 检测系统架构
+ARCH=$(uname -m)
+echo "[*] 系统架构: $ARCH"
+
 # 检查 stress-ng
 if ! command -v stress-ng &> /dev/null; then
     echo "✗ 请先安装 stress-ng"
@@ -22,6 +26,10 @@ if ! command -v stress-ng &> /dev/null; then
     echo "  macOS: brew install stress-ng"
     exit 1
 fi
+
+# 显示 stress-ng 版本信息
+STRESS_VERSION=$(stress-ng --version 2>/dev/null | head -1 || echo "Unknown")
+echo "[*] stress-ng 版本: $STRESS_VERSION"
 
 # 检查 sudo 权限
 if ! sudo -n true 2>/dev/null; then
@@ -54,14 +62,21 @@ echo "[*] 检测到 cgroup $CGROUP_TYPE"
 CPU_CORES=$(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo "1")
 
 if [[ "$THREADS" == "auto" ]]; then
-    # 根据目标 CPU 使用率智能计算线程数
-    RECOMMENDED_THREADS=$(( CPU_CORES * TARGET_CPU_PERCENT / 100 ))
-    THREADS=$(( RECOMMENDED_THREADS > 0 ? RECOMMENDED_THREADS : 1 ))
-    
-    # 确保线程数不超过核心数的 1.5 倍（避免过度竞争）
-    MAX_THREADS=$(( CPU_CORES * 3 / 2 ))
-    if [[ $THREADS -gt $MAX_THREADS ]]; then
-        THREADS=$MAX_THREADS
+    # ARM 架构使用不同的线程策略
+    if [[ "$ARCH" =~ ^(aarch64|arm64|armv7l|armv8)$ ]]; then
+        # ARM 架构：使用核心数作为线程数，效果更好
+        THREADS=$CPU_CORES
+        echo "[*] ARM 架构检测：使用核心数作为线程数"
+    else
+        # x86 架构：根据目标 CPU 使用率计算
+        RECOMMENDED_THREADS=$(( CPU_CORES * TARGET_CPU_PERCENT / 100 ))
+        THREADS=$(( RECOMMENDED_THREADS > 0 ? RECOMMENDED_THREADS : 1 ))
+        
+        # 确保线程数不超过核心数的 1.5 倍
+        MAX_THREADS=$(( CPU_CORES * 3 / 2 ))
+        if [[ $THREADS -gt $MAX_THREADS ]]; then
+            THREADS=$MAX_THREADS
+        fi
     fi
 fi
 
@@ -123,8 +138,40 @@ elif [[ "$CGROUP_TYPE" == "v1" ]]; then
     echo "$QUOTA_US"  | sudo tee "$CGROUP_PATH/cpu.cfs_quota_us" > /dev/null
 fi
 
+# ======== 选择合适的 stress-ng 方法 ========
+# ARM 架构优化的 CPU 方法选择
+if [[ "$ARCH" =~ ^(aarch64|arm64|armv7l|armv8)$ ]]; then
+    # ARM 架构：使用更适合的 CPU 方法
+    echo "[*] 测试 ARM 架构兼容的 CPU 方法..."
+    
+    # 测试可用的方法
+    AVAILABLE_METHODS=()
+    for method in "ackermann" "correlate" "euler" "fft" "matrixprod" "prime"; do
+        if timeout 2s stress-ng --cpu 1 --cpu-method "$method" --timeout 1s --quiet >/dev/null 2>&1; then
+            AVAILABLE_METHODS+=("$method")
+            echo "  ✓ $method"
+        else
+            echo "  ✗ $method (不兼容)"
+        fi
+    done
+    
+    if [[ ${#AVAILABLE_METHODS[@]} -gt 0 ]]; then
+        # 使用第一个可用的方法
+        SELECTED_METHOD="${AVAILABLE_METHODS[0]}"
+        echo "[*] 选择的 CPU 方法: $SELECTED_METHOD"
+    else
+        # 回退到默认方法
+        SELECTED_METHOD="all"
+        echo "[*] 使用默认 CPU 方法: all"
+    fi
+else
+    # x86 架构使用原方法
+    SELECTED_METHOD="matrixprod"
+    echo "[*] x86 架构使用 CPU 方法: $SELECTED_METHOD"
+fi
+
 # ======== 构建 stress-ng 命令 ========
-STRESS_CMD="stress-ng --cpu $THREADS --cpu-method matrixprod --timeout ${DURATION}s --metrics-brief"
+STRESS_CMD="stress-ng --cpu $THREADS --cpu-method $SELECTED_METHOD --timeout ${DURATION}s --metrics-brief --verify"
 
 # 添加 nice 和 ionice
 PRIORITY_CMD="nice -n $NICE_LEVEL"
@@ -162,41 +209,94 @@ echo "[✓] stress-ng 进程已加入 cgroup，正在恢复执行..."
 kill -CONT $STRESS_PID
 echo "[✓] stress-ng 开始受限执行 (cgroup + nice/ionice)"
 
-# ======== 实时监控函数 ========
+# ======== 改进的实时监控函数 ========
 monitor_cpu() {
-    local count=0
-    local max_samples=20
-    
     echo "[*] 开始监控 CPU 使用情况..."
+    local count=0
+    local max_samples=$(( DURATION / 5 ))  # 每5秒监控一次
     
-    while kill -0 $STRESS_PID 2>/dev/null && [[ $count -lt $max_samples ]]; do
-        if command -v top &> /dev/null; then
-            # 获取 stress-ng 进程的 CPU 使用率
+    # 确保至少监控20次
+    if [[ $max_samples -lt 20 ]]; then
+        max_samples=20
+    fi
+    
+    while [[ $count -lt $max_samples ]]; do
+        # 检查进程是否还在运行
+        if ! kill -0 $STRESS_PID 2>/dev/null; then
+            echo "[*] stress-ng 进程已结束，停止监控"
+            break
+        fi
+        
+        # 使用多种方法获取 CPU 使用率
+        local cpu_usage=""
+        local system_load=""
+        
+        # 方法1：使用 ps 命令（更可靠）
+        if command -v ps &> /dev/null; then
+            cpu_usage=$(ps -p $STRESS_PID -o %cpu= 2>/dev/null | awk '{print $1}')
+        fi
+        
+        # 方法2：获取系统整体负载
+        if [[ -f /proc/loadavg ]]; then
+            system_load=$(cat /proc/loadavg | awk '{print $1}')
+        fi
+        
+        # 方法3：使用 top 作为备选
+        if [[ -z "$cpu_usage" ]] && command -v top &> /dev/null; then
             if [[ "$(uname)" == "Darwin" ]]; then
                 # macOS
-                CPU_USAGE=$(top -pid $STRESS_PID -l 1 -stats pid,cpu 2>/dev/null | tail -1 | awk '{print $2}' | sed 's/%//')
+                cpu_usage=$(top -pid $STRESS_PID -l 1 -stats pid,cpu 2>/dev/null | tail -1 | awk '{print $2}' | sed 's/%//')
             else
                 # Linux
-                CPU_USAGE=$(top -p $STRESS_PID -n 1 -b 2>/dev/null | tail -1 | awk '{print $9}')
-            fi
-            
-            if [[ -n "$CPU_USAGE" && "$CPU_USAGE" != "CPU" && "$CPU_USAGE" != "0.0" ]]; then
-                echo "[$(date '+%H:%M:%S')] stress-ng CPU: ${CPU_USAGE}% | 目标限制: ${TARGET_CPU_PERCENT}%"
+                cpu_usage=$(top -p $STRESS_PID -n 1 -b 2>/dev/null | tail -1 | awk '{print $9}')
             fi
         fi
         
-        sleep 3
+        # 输出监控信息
+        local timestamp=$(date '+%H:%M:%S')
+        local output="[$timestamp]"
+        
+        if [[ -n "$cpu_usage" && "$cpu_usage" != "0" && "$cpu_usage" != "0.0" ]]; then
+            output="$output stress-ng CPU: ${cpu_usage}%"
+        else
+            output="$output stress-ng CPU: 检测中..."
+        fi
+        
+        if [[ -n "$system_load" ]]; then
+            output="$output | 系统负载: ${system_load}"
+        fi
+        
+        output="$output | 目标限制: ${TARGET_CPU_PERCENT}%"
+        
+        echo "$output"
+        
+        # cgroup 使用统计（每10次显示一次）
+        if [[ $(( count % 10 )) -eq 0 ]] && [[ "$CGROUP_TYPE" == "v1" ]] && [[ -f "$CGROUP_PATH/cpuacct.usage" ]]; then
+            local total_usage=$(cat "$CGROUP_PATH/cpuacct.usage" 2>/dev/null)
+            if [[ -n "$total_usage" ]]; then
+                local usage_sec=$(( total_usage / 1000000000 ))
+                echo "    └─ cgroup 累计 CPU 时间: ${usage_sec}s"
+            fi
+        fi
+        
+        sleep 5
         ((count++))
     done
+    
+    echo "[*] 监控结束"
 }
 
-# 启动监控（后台运行）
+# 启动监控（前台运行，确保实时输出）
 monitor_cpu &
 MONITOR_PID=$!
 
 # ======== 等待压测完成 ========
 wait $STRESS_PID
 STRESS_EXIT_CODE=$?
+
+# 停止监控
+kill $MONITOR_PID 2>/dev/null || true
+wait $MONITOR_PID 2>/dev/null || true
 
 echo "=========================================="
 if [[ $STRESS_EXIT_CODE -eq 0 ]]; then
@@ -210,7 +310,11 @@ if [[ "$CGROUP_TYPE" == "v1" && -f "$CGROUP_PATH/cpuacct.usage" ]]; then
     TOTAL_CPU_TIME=$(cat "$CGROUP_PATH/cpuacct.usage" 2>/dev/null)
     if [[ -n "$TOTAL_CPU_TIME" ]]; then
         TOTAL_CPU_TIME_SEC=$(( TOTAL_CPU_TIME / 1000000000 ))
-        echo "[*] cgroup 统计: 总 CPU 时间 ${TOTAL_CPU_TIME_SEC}s"
+        EXPECTED_MAX_TIME=$(( TARGET_CPU_PERCENT * DURATION / 100 ))
+        echo "[*] cgroup 统计信息:"
+        echo "    ├─ 总 CPU 时间: ${TOTAL_CPU_TIME_SEC}s"
+        echo "    ├─ 预期最大时间: ${EXPECTED_MAX_TIME}s (${TARGET_CPU_PERCENT}% × ${DURATION}s)"
+        echo "    └─ 限制效果: $( [[ $TOTAL_CPU_TIME_SEC -le $EXPECTED_MAX_TIME ]] && echo "✓ 有效" || echo "✗ 可能超限" )"
     fi
 fi
 
@@ -223,6 +327,11 @@ cat << 'EOF'
 ├── cgroup 硬限制: 内核级 CPU 配额控制，绝对不会超过设定值
 ├── nice 软优先级: 进程调度优先级，主动让出 CPU 时间片
 └── ionice I/O优先级: 降低磁盘访问优先级（Linux）
+
+ARM 架构优化：
+├── 自动检测架构并选择合适的 stress-ng 方法
+├── 优化线程数计算策略
+└── 兼容性测试确保稳定运行
 
 使用方法：
   sudo ./cpu_load_limit.sh [CPU%] [时长s] [线程数] [nice值]
