@@ -256,27 +256,26 @@ echo "[*] 开始压测..."
 echo "=========================================="
 
 # ======== 启动 stress-ng ========
-# 使用 SIGSTOP 机制避免启动初期资源失控
-echo "[*] 启动 stress-ng 进程（暂停状态）..."
+echo "[*] 启动 stress-ng 进程..."
 eval "$FINAL_CMD" &
 STRESS_PID=$!
-
-# 立即暂停进程，防止资源使用失控
-kill -STOP $STRESS_PID
-echo "[*] stress-ng 进程 ($STRESS_PID) 已暂停，准备加入 cgroup..."
+echo "[*] stress-ng 进程已启动，PID: $STRESS_PID"
 
 # ======== 将进程加入 cgroup ========
 if [[ "$CGROUP_ENABLED" == "true" ]]; then
-    echo "[*] 将进程 $STRESS_PID 加入 cgroup..."
+    echo "[*] 将主进程 $STRESS_PID 加入 cgroup..."
+    
+    # 等待进程完全启动
+    sleep 1
     
     if [[ "$CGROUP_TYPE" == "v2" ]]; then
         echo "$STRESS_PID" | sudo tee "$CGROUP_PATH/cgroup.procs" > /dev/null
         
         # 验证进程是否成功加入
         if grep -q "^$STRESS_PID$" "$CGROUP_PATH/cgroup.procs" 2>/dev/null; then
-            echo "[✓] 进程成功加入 cgroup v2"
+            echo "[✓] 主进程成功加入 cgroup v2"
         else
-            echo "[✗] 警告: 进程可能未成功加入 cgroup v2"
+            echo "[✗] 警告: 主进程可能未成功加入 cgroup v2"
         fi
         
     elif [[ "$CGROUP_TYPE" == "v1" ]]; then
@@ -284,72 +283,15 @@ if [[ "$CGROUP_ENABLED" == "true" ]]; then
         
         # 验证进程是否成功加入
         if grep -q "^$STRESS_PID$" "$CGROUP_PATH/tasks" 2>/dev/null; then
-            echo "[✓] 进程成功加入 cgroup v1"
+            echo "[✓] 主进程成功加入 cgroup v1"
         else
-            echo "[✗] 警告: 进程可能未成功加入 cgroup v1"
+            echo "[✗] 警告: 主进程可能未成功加入 cgroup v1"
         fi
     fi
     
-    echo "[*] 恢复进程执行，开始应用 cgroup 限制..."
-else
-    echo "[*] 跳过 cgroup 配置，直接恢复进程执行..."
-fi
-
-# 恢复进程执行，现在已受 cgroup 限制（如果启用）
-kill -CONT $STRESS_PID
-if [[ "$CGROUP_ENABLED" == "true" ]]; then
     echo "[✓] stress-ng 开始受限执行 (cgroup + nice/ionice)"
 else
     echo "[✓] stress-ng 开始执行 (仅 nice/ionice)"
-fi
-
-# 等待一下让进程完全启动
-sleep 2
-
-# 验证子进程也被加入cgroup（stress-ng可能会创建子进程）
-if [[ "$CGROUP_ENABLED" == "true" ]]; then
-    echo "[*] 检查所有相关进程是否在 cgroup 中..."
-    
-    # 获取所有 stress-ng 相关进程
-    ALL_STRESS_PIDS=$(pgrep -f "stress-ng" | tr '\n' ' ')
-    echo "[*] 系统中所有 stress-ng 进程: $ALL_STRESS_PIDS"
-    
-    if [[ "$CGROUP_TYPE" == "v2" ]]; then
-        PROCS_IN_CGROUP=$(cat "$CGROUP_PATH/cgroup.procs" 2>/dev/null)
-        PROC_COUNT=$(echo "$PROCS_IN_CGROUP" | wc -l)
-        echo "[*] cgroup 中的进程数: $PROC_COUNT"
-        echo "[*] cgroup 中的进程列表: $PROCS_IN_CGROUP"
-        
-        # 将所有 stress-ng 进程加入 cgroup
-        for pid in $ALL_STRESS_PIDS; do
-            if [[ -n "$pid" ]]; then
-                echo "$pid" | sudo tee "$CGROUP_PATH/cgroup.procs" > /dev/null 2>&1
-                echo "    └─ 添加进程 $pid 到 cgroup"
-            fi
-        done
-        
-    elif [[ "$CGROUP_TYPE" == "v1" ]]; then
-        PROCS_IN_CGROUP=$(cat "$CGROUP_PATH/tasks" 2>/dev/null)
-        PROC_COUNT=$(echo "$PROCS_IN_CGROUP" | wc -l)
-        echo "[*] cgroup 中的进程数: $PROC_COUNT"
-        echo "[*] cgroup 中的进程列表: $PROCS_IN_CGROUP"
-        
-        # 将所有 stress-ng 进程加入 cgroup
-        for pid in $ALL_STRESS_PIDS; do
-            if [[ -n "$pid" ]]; then
-                echo "$pid" | sudo tee "$CGROUP_PATH/tasks" > /dev/null 2>&1
-                echo "    └─ 添加进程 $pid 到 cgroup"
-            fi
-        done
-    fi
-    
-    echo "[*] 重新检查 cgroup 进程数..."
-    if [[ "$CGROUP_TYPE" == "v2" ]]; then
-        FINAL_COUNT=$(cat "$CGROUP_PATH/cgroup.procs" 2>/dev/null | wc -l)
-    elif [[ "$CGROUP_TYPE" == "v1" ]]; then
-        FINAL_COUNT=$(cat "$CGROUP_PATH/tasks" 2>/dev/null | wc -l)
-    fi
-    echo "[*] 最终 cgroup 中的进程数: $FINAL_COUNT"
 fi
 
 # ======== 改进的实时监控函数 ========
