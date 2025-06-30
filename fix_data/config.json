@@ -1,0 +1,15 @@
+{
+  "history_archive_db": {
+    "host": "localhost",
+    "port": 3306,
+    "username": "root",
+    "password": "password",
+    "database": "archive_db",
+    "table": "history_arc"
+  },
+  "target_db_defaults": {
+    "username": "root",
+    "password": "password"
+  },
+  "backup_dir": "./backups"
+} 

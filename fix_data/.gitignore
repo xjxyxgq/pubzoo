@@ -1,0 +1,19 @@
+# 可执行文件
+fix_data
+fix_data.exe
+
+# 备份目录
+backups/
+
+# 日志文件
+*.log
+
+# 临时文件
+*.tmp
+
+# 配置文件（如果包含敏感信息）
+# config.json
+
+# Go 编译缓存
+*.out
+*.test 

@@ -1,0 +1,5 @@
+# 示例任务文件
+# 格式：目标数据库地址,数据库名称,数据表名称,检索条件(YYYYmmdd),预期行数
+localhost:3306,test_db,user_logs,20240101,1000
+192.168.1.100:3306,product_db,order_records,20240102,2500
+localhost:3306,analytics_db,page_views,20240103,5000 
