@@ -1,6 +1,6 @@
-module pubzoo
+module github.com/xjxyxgq/pubzoo
 
-go 1.21.1
+go 1.23.1
 
 require github.com/go-sql-driver/mysql v1.9.3
 
