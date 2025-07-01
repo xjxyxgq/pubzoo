@@ -115,6 +115,69 @@ func (dm *DatabaseManager) GetColumnDataType(db *sql.DB, database, table, column
 	return dataType, nil
 }
 
+// CheckDatabaseStatus 检查数据库状态，确保可以安全执行写操作
+func (dm *DatabaseManager) CheckDatabaseStatus(db *sql.DB, host, database string) error {
+	// 1. 检查数据库是否为只读状态
+	var readOnly int
+	err := db.QueryRow("SELECT @@read_only").Scan(&readOnly)
+	if err != nil {
+		return fmt.Errorf("检查数据库只读状态失败: %v", err)
+	}
+
+	if readOnly == 1 {
+		return fmt.Errorf("数据库 %s/%s 处于只读状态，无法执行写操作", host, database)
+	}
+
+	// 2. 检查是否为从节点
+	isSlaveNode, err := dm.checkSlaveStatus(db)
+	if err != nil {
+		return fmt.Errorf("检查从节点状态失败: %v", err)
+	}
+
+	if isSlaveNode {
+		return fmt.Errorf("数据库 %s/%s 是从节点，无法执行写操作", host, database)
+	}
+
+	return nil
+}
+
+// checkSlaveStatus 检查是否为从节点
+func (dm *DatabaseManager) checkSlaveStatus(db *sql.DB) (bool, error) {
+	// 执行 SHOW SLAVE STATUS 命令
+	rows, err := db.Query("SHOW SLAVE STATUS")
+	if err != nil {
+		return false, fmt.Errorf("执行 SHOW SLAVE STATUS 失败: %v", err)
+	}
+	defer rows.Close()
+
+	// 如果有结果返回，说明配置了主从复制
+	if rows.Next() {
+		// 检查复制状态
+		columns, err := rows.Columns()
+		if err != nil {
+			return false, fmt.Errorf("获取从节点状态列信息失败: %v", err)
+		}
+
+		// 创建扫描目标
+		values := make([]interface{}, len(columns))
+		valuePtrs := make([]interface{}, len(columns))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		// 扫描行数据
+		if err := rows.Scan(valuePtrs...); err != nil {
+			return false, fmt.Errorf("扫描从节点状态失败: %v", err)
+		}
+
+		// 如果有从节点配置记录，则认为是从节点
+		return true, nil
+	}
+
+	// 没有从节点配置，是主节点或独立节点
+	return false, nil
+}
+
 // CountRowsByCondition 根据条件统计行数
 func (dm *DatabaseManager) CountRowsByCondition(db *sql.DB, table, column, condition, dataType string) (int, error) {
 	var query string

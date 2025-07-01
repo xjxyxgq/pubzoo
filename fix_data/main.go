@@ -175,14 +175,22 @@ func processTask(dbManager *DatabaseManager, task CheckTask) (CheckResult, error
 		return result, fmt.Errorf("连接目标数据库失败: %v", err)
 	}
 
-	// 3. 获取归档列的数据类型
+	// 3. 检查数据库状态（只读状态和从节点检查）
+	fmt.Println("检查数据库状态...")
+	err = dbManager.CheckDatabaseStatus(targetDB, task.TargetDBHost, task.DatabaseName)
+	if err != nil {
+		return result, fmt.Errorf("数据库状态检查失败: %v", err)
+	}
+	fmt.Println("✓ 数据库状态正常，可以执行写操作")
+
+	// 4. 获取归档列的数据类型
 	dataType, err := dbManager.GetColumnDataType(targetDB, task.DatabaseName, task.TableName, archiveColumn)
 	if err != nil {
 		return result, fmt.Errorf("获取列数据类型失败: %v", err)
 	}
 	fmt.Printf("归档列数据类型: %s\n", dataType)
 
-	// 4. 统计符合条件的行数
+	// 5. 统计符合条件的行数
 	actualCount, err := dbManager.CountRowsByCondition(targetDB, task.TableName, archiveColumn, task.SearchCondition, dataType)
 	if err != nil {
 		return result, fmt.Errorf("统计行数失败: %v", err)
@@ -229,6 +237,14 @@ func performDeletion(dbManager *DatabaseManager, result CheckResult) error {
 	if err != nil {
 		return fmt.Errorf("连接目标数据库失败: %v", err)
 	}
+
+	// 再次检查数据库状态（确保删除前数据库仍然可写）
+	fmt.Println("再次检查数据库状态...")
+	err = dbManager.CheckDatabaseStatus(targetDB, result.Task.TargetDBHost, result.Task.DatabaseName)
+	if err != nil {
+		return fmt.Errorf("删除前数据库状态检查失败: %v", err)
+	}
+	fmt.Println("✓ 删除前数据库状态正常")
 
 	// 获取列数据类型
 	dataType, err := dbManager.GetColumnDataType(targetDB, result.Task.DatabaseName, result.Task.TableName, result.ArchiveColumn)
