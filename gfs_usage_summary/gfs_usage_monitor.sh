@@ -20,6 +20,19 @@ ACTIVE_DIRS=(
     "user_uploads"
 )
 
+# 检测操作系统类型
+detect_os() {
+    if [[ "$OSTYPE" == "darwin"* ]]; then
+        echo "macos"
+    elif [[ "$OSTYPE" == "linux-gnu"* ]]; then
+        echo "linux"
+    else
+        echo "unknown"
+    fi
+}
+
+OS_TYPE=$(detect_os)
+
 # 函数：显示使用方法
 show_usage() {
     echo "用法: $0 <gfs_mount_point>"
@@ -41,8 +54,15 @@ check_directory() {
 
 # 函数：将字节转换为人类可读格式
 bytes_to_human() {
-    local bytes=$1
-    if [ $bytes -eq 0 ]; then
+    local bytes="$1"
+    
+    # 验证输入是否为数字
+    if ! [[ "$bytes" =~ ^[0-9]+$ ]]; then
+        echo "0B"
+        return
+    fi
+    
+    if [ "$bytes" -eq 0 ]; then
         echo "0B"
         return
     fi
@@ -59,26 +79,30 @@ bytes_to_human() {
     echo "${size}${units[$unit]}"
 }
 
-# 函数：将人类可读格式转换为字节
-human_to_bytes() {
-    local size_str="$1"
-    local size=$(echo "$size_str" | grep -o '[0-9.]*')
-    local unit=$(echo "$size_str" | grep -o '[A-Z]*$')
-    
-    case "$unit" in
-        "K"|"KB") echo $(echo "$size * 1024" | bc -l | cut -d. -f1) ;;
-        "M"|"MB") echo $(echo "$size * 1024 * 1024" | bc -l | cut -d. -f1) ;;
-        "G"|"GB") echo $(echo "$size * 1024 * 1024 * 1024" | bc -l | cut -d. -f1) ;;
-        "T"|"TB") echo $(echo "$size * 1024 * 1024 * 1024 * 1024" | bc -l | cut -d. -f1) ;;
-        *) echo $(echo "$size" | cut -d. -f1) ;;
-    esac
-}
-
 # 函数：获取目录大小（字节）
 get_dir_size_bytes() {
     local dir="$1"
     if [ -d "$dir" ]; then
-        du -sb "$dir" 2>/dev/null | cut -f1
+        if [ "$OS_TYPE" = "macos" ]; then
+            # macOS使用不同的du参数
+            du -s "$dir" 2>/dev/null | awk '{print $1 * 512}' # macOS du默认以512字节块为单位
+        else
+            du -sb "$dir" 2>/dev/null | cut -f1
+        fi
+    else
+        echo "0"
+    fi
+}
+
+# 函数：获取文件大小（字节）
+get_file_size() {
+    local file="$1"
+    if [ -f "$file" ]; then
+        if [ "$OS_TYPE" = "macos" ]; then
+            stat -f%z "$file" 2>/dev/null || echo "0"
+        else
+            stat -c%s "$file" 2>/dev/null || echo "0"
+        fi
     else
         echo "0"
     fi
@@ -98,12 +122,42 @@ get_modified_size() {
     local total_size=0
     while IFS= read -r -d '' file; do
         if [ -f "$file" ]; then
-            local file_size=$(stat -c%s "$file" 2>/dev/null || echo "0")
-            total_size=$((total_size + file_size))
+            local file_size=$(get_file_size "$file")
+            if [[ "$file_size" =~ ^[0-9]+$ ]]; then
+                total_size=$((total_size + file_size))
+            fi
         fi
     done < <(find "$dir" -type f -mtime -"$days" -print0 2>/dev/null)
     
     echo "$total_size"
+}
+
+# 函数：获取文件系统信息（字节）
+get_filesystem_info() {
+    local path="$1"
+    
+    if [ "$OS_TYPE" = "macos" ]; then
+        # macOS版本
+        local df_output=$(df -k "$path" | tail -1)
+        local total_kb=$(echo "$df_output" | awk '{print $2}')
+        local used_kb=$(echo "$df_output" | awk '{print $3}')
+        local avail_kb=$(echo "$df_output" | awk '{print $4}')
+        
+        # 转换为字节
+        local total_bytes=$((total_kb * 1024))
+        local used_bytes=$((used_kb * 1024))
+        local avail_bytes=$((avail_kb * 1024))
+        
+        echo "$total_bytes:$used_bytes:$avail_bytes"
+    else
+        # Linux版本
+        local df_output=$(df -B1 "$path" | tail -1)
+        local total_bytes=$(echo "$df_output" | awk '{print $2}')
+        local used_bytes=$(echo "$df_output" | awk '{print $3}')
+        local avail_bytes=$(echo "$df_output" | awk '{print $4}')
+        
+        echo "$total_bytes:$used_bytes:$avail_bytes"
+    fi
 }
 
 # 函数：生成目录维度报告
@@ -127,21 +181,28 @@ generate_directory_report() {
             
             # 获取当前容量
             local current_bytes=$(get_dir_size_bytes "$full_path")
-            local current_human=$(bytes_to_human $current_bytes)
+            local current_human=$(bytes_to_human "$current_bytes")
             
             # 获取日增量（过去1天）
             local daily_bytes=$(get_modified_size "$full_path" 1)
-            local daily_human=$(bytes_to_human $daily_bytes)
+            local daily_human=$(bytes_to_human "$daily_bytes")
             
             # 获取月增量（过去30天）
             local monthly_bytes=$(get_modified_size "$full_path" 30)
-            local monthly_human=$(bytes_to_human $monthly_bytes)
+            local monthly_human=$(bytes_to_human "$monthly_bytes")
             
             printf "%-30s %-12s %-12s %-12s\n" "$dir_name" "$current_human" "$daily_human" "$monthly_human"
             
-            total_current=$((total_current + current_bytes))
-            total_daily=$((total_daily + daily_bytes))
-            total_monthly=$((total_monthly + monthly_bytes))
+            # 安全地累加数值
+            if [[ "$current_bytes" =~ ^[0-9]+$ ]]; then
+                total_current=$((total_current + current_bytes))
+            fi
+            if [[ "$daily_bytes" =~ ^[0-9]+$ ]]; then
+                total_daily=$((total_daily + daily_bytes))
+            fi
+            if [[ "$monthly_bytes" =~ ^[0-9]+$ ]]; then
+                total_monthly=$((total_monthly + monthly_bytes))
+            fi
         else
             printf "%-30s %-12s %-12s %-12s\n" "$dir_name" "目录不存在" "-" "-"
         fi
@@ -169,15 +230,21 @@ generate_top10_dirs() {
         local full_path="$gfs_path/$dir_name"
         if [ -d "$full_path" ]; then
             local size_bytes=$(get_dir_size_bytes "$full_path")
-            echo "$size_bytes:$dir_name" >> "$temp_file"
+            if [[ "$size_bytes" =~ ^[0-9]+$ ]]; then
+                echo "$size_bytes:$dir_name" >> "$temp_file"
+            fi
         fi
     done
     
     # 排序并显示TOP10
-    sort -nr "$temp_file" | head -10 | while IFS=: read -r size_bytes dir_name; do
-        local size_human=$(bytes_to_human $size_bytes)
-        printf "%-30s %s\n" "$dir_name" "$size_human"
-    done
+    if [ -s "$temp_file" ]; then
+        sort -nr "$temp_file" | head -10 | while IFS=: read -r size_bytes dir_name; do
+            local size_human=$(bytes_to_human "$size_bytes")
+            printf "%-30s %s\n" "$dir_name" "$size_human"
+        done
+    else
+        echo "没有找到有效的目录数据"
+    fi
     
     rm -f "$temp_file"
 }
@@ -198,11 +265,19 @@ generate_total_report() {
     # 解析总计数据
     IFS=':' read -r total_current total_daily total_monthly <<< "$totals"
     
+    # 验证数据有效性
+    if ! [[ "$total_current" =~ ^[0-9]+$ ]]; then total_current=0; fi
+    if ! [[ "$total_daily" =~ ^[0-9]+$ ]]; then total_daily=0; fi
+    if ! [[ "$total_monthly" =~ ^[0-9]+$ ]]; then total_monthly=0; fi
+    
     # 获取文件系统信息
-    local fs_info=$(df -B1 "$gfs_path" | tail -1)
-    local fs_total=$(echo "$fs_info" | awk '{print $2}')
-    local fs_used=$(echo "$fs_info" | awk '{print $3}')
-    local fs_available=$(echo "$fs_info" | awk '{print $4}')
+    local fs_info=$(get_filesystem_info "$gfs_path")
+    IFS=':' read -r fs_total fs_used fs_available <<< "$fs_info"
+    
+    # 验证文件系统数据
+    if ! [[ "$fs_total" =~ ^[0-9]+$ ]]; then fs_total=0; fi
+    if ! [[ "$fs_used" =~ ^[0-9]+$ ]]; then fs_used=0; fi
+    if ! [[ "$fs_available" =~ ^[0-9]+$ ]]; then fs_available=0; fi
     
     echo -e "${YELLOW}文件系统容量信息:${NC}"
     printf "%-15s %s\n" "总容量:" "$(bytes_to_human $fs_total)"
@@ -218,7 +293,7 @@ generate_total_report() {
     
     # 计算预计可用时长
     echo -e "${YELLOW}容量预测:${NC}"
-    if [ $total_daily -gt 0 ]; then
+    if [ "$total_daily" -gt 0 ] && [ "$fs_available" -gt 0 ]; then
         local days_remaining=$((fs_available / total_daily))
         printf "%-15s %d 天\n" "按日增量预计:" "$days_remaining"
         
@@ -231,10 +306,14 @@ generate_total_report() {
         printf "%-15s %s\n" "按日增量预计:" "无增量或负增长"
     fi
     
-    if [ $total_monthly -gt 0 ]; then
+    if [ "$total_monthly" -gt 0 ] && [ "$fs_available" -gt 0 ]; then
         local monthly_avg=$((total_monthly / 30))
-        local days_remaining_monthly=$((fs_available / monthly_avg))
-        printf "%-15s %d 天\n" "按月均增量预计:" "$days_remaining_monthly"
+        if [ "$monthly_avg" -gt 0 ]; then
+            local days_remaining_monthly=$((fs_available / monthly_avg))
+            printf "%-15s %d 天\n" "按月均增量预计:" "$days_remaining_monthly"
+        else
+            printf "%-15s %s\n" "按月均增量预计:" "无增量"
+        fi
     else
         printf "%-15s %s\n" "按月均增量预计:" "无增量或负增长"
     fi
@@ -244,6 +323,7 @@ generate_total_report() {
 main() {
     echo -e "${GREEN}GFS目录增量统计和容量预测工具${NC}"
     echo "=================================================="
+    echo "操作系统类型: $OS_TYPE"
     echo ""
     
     # 检查参数
@@ -259,7 +339,12 @@ main() {
     fi
     
     # 检查必要的命令是否存在
-    for cmd in du find df stat bc; do
+    local required_cmds=("du" "find" "df" "stat")
+    if [ "$OS_TYPE" != "macos" ]; then
+        required_cmds+=("bc")
+    fi
+    
+    for cmd in "${required_cmds[@]}"; do
         if ! command -v "$cmd" >/dev/null 2>&1; then
             echo -e "${RED}错误: 命令 '$cmd' 未找到，请确保已安装${NC}"
             exit 1
